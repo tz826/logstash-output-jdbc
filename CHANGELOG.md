@@ -1,6 +1,10 @@
 # Change Log
 All notable changes to this project will be documented in this file, from 0.2.0.
 
+## [5.5.0] - 2019-04-11
+  - Adds idle_timeout and max_lifetime connection params
+  - Adds batch insert support with configurable batch size and support for unsafe statements (by @iBspoof) 
+
 ## [5.3.0] - 2017-11-08
   - Adds configuration options `enable_event_as_json_keyword` and `event_as_json_keyword`
   - Adds BigDecimal support

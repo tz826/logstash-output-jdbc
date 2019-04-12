@@ -7,6 +7,7 @@ require 'java'
 require 'logstash-output-jdbc_jars'
 require 'json'
 require 'bigdecimal'
+require 'enumerator'
 
 # Write events to a SQL engine, using JDBC.
 #
@@ -19,19 +20,20 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
   STRFTIME_FMT = '%Y-%m-%d %T.%L'.freeze
 
   RETRYABLE_SQLSTATE_CLASSES = [
-    # Classes of retryable SQLSTATE codes
-    # Not all in the class will be retryable. However, this is the best that 
-    # we've got right now.
-    # If a custom state code is required, set it in retry_sql_states.
-    '08', # Connection Exception
-    '24', # Invalid Cursor State (Maybe retry-able in some circumstances)
-    '25', # Invalid Transaction State 
-    '40', # Transaction Rollback 
-    '53', # Insufficient Resources
-    '54', # Program Limit Exceeded (MAYBE)
-    '55', # Object Not In Prerequisite State
-    '57', # Operator Intervention
-    '58', # System Error
+      # Classes of retryable SQLSTATE codes
+      # Not all in the class will be retryable. However, this is the best that
+      # we've got right now.
+      # If a custom state code is required, set it in retry_sql_states.
+      '08', # Connection Exception
+      '24', # Invalid Cursor State (Maybe retry-able in some circumstances)
+      '25', # Invalid Transaction State
+      '40', # Transaction Rollback
+      '42', # Access Rule Violation
+      '53', # Insufficient Resources
+      '54', # Program Limit Exceeded (MAYBE)
+      '55', # Object Not In Prerequisite State
+      '57', # Operator Intervention
+      '58', # System Error
   ].freeze
 
   config_name 'jdbc'
@@ -70,6 +72,12 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
   # Connection timeout
   config :connection_timeout, validate: :number, default: 10000
 
+  # Max Life Time
+  config :max_lifetime, validate: :number, default: 300000
+
+  # Idle Timeout
+  config :idle_timeout, validate: :number, default: 290000
+
   # We buffer a certain number of events before flushing that out to SQL.
   # This setting controls how many events will be buffered before sending a
   # batch of events.
@@ -100,24 +108,32 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
   config :max_repeat_exceptions, obsolete: 'This has been replaced by max_flush_exceptions - which behaves slightly differently. Please check the documentation.'
   config :max_repeat_exceptions_time, obsolete: 'This is no longer required'
   config :idle_flush_time, obsolete: 'No longer necessary under Logstash v5'
-  
+
   # Allows the whole event to be converted to JSON
   config :enable_event_as_json_keyword, validate: :boolean, default: false
-  
+
   # The magic key used to convert the whole event to JSON. If you need this, and you have the default in your events, you can use this to change your magic keyword.
   config :event_as_json_keyword, validate: :string, default: '@event'
+
+  config :use_batch_inserts, validate: :boolean, default: false
+
+  config :batch_size, validate: :number, default: 100
 
   def register
     @logger.info('JDBC - Starting up')
 
     load_jar_files!
 
-    @stopping = Concurrent::AtomicBoolean.new(false)
+    @stopping = Concurrent::AtomicBoolean.new
 
     @logger.warn('JDBC - Flush size is set to > 1000') if @flush_size > 1000
 
     if @statement.empty?
       @logger.error('JDBC - No statement provided. Configuration error.')
+    end
+
+    if use_batch_inserts
+      @logger.debug("JDBC - batch inserts enabled size of #{batch_size.to_s}")
     end
 
     if !@unsafe_statement && @statement.length < 2
@@ -155,6 +171,9 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
 
     @pool.setMaximumPoolSize(@max_pool_size)
     @pool.setConnectionTimeout(@connection_timeout)
+
+    @pool.setMaxLifetime(@max_lifetime)
+    @pool.setIdleTimeout(@idle_timeout)
 
     validate_connection_timeout = (@connection_timeout / 1000) / 2
 
@@ -201,8 +220,6 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
   end
 
   def submit(events)
-    connection = nil
-    statement = nil
     events_to_retry = []
 
     begin
@@ -214,25 +231,82 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
       return events, false
     end
 
-    events.each do |event|
-      begin
-        statement = connection.prepareStatement(
-          (@unsafe_statement == true) ? event.sprintf(@statement[0]) : @statement[0]
-        )
-        statement = add_statement_event_params(statement, event) if @statement.length > 1
-        statement.execute
-      rescue => e
-        if retry_exception?(e, event.to_json())
-          events_to_retry.push(event)
+    if use_batch_inserts
+
+      batch_by_statement = {}
+      if @unsafe_statement
+        events.each do |event|
+          insert_query = event.sprintf(@statement[0])
+          unless batch_by_statement.key?(insert_query)
+            batch_by_statement[insert_query] = []
+          end
+          batch_by_statement[insert_query].append(event)
         end
-      ensure
-        statement.close unless statement.nil?
+      else
+        batch_by_statement[@statement[0]] = events
       end
+
+      batch_by_statement.each do |insert_query, p_events|
+        @logger.debug("Processing #{p_events.count} events for #{insert_query}")
+        retries = process_batch(connection, insert_query, p_events)
+        unless retries.empty?
+          @logger.warn("Failed to insert #{retries.count} events for statement \"#{insert_query}\", re-queuing.")
+          events_to_retry.append(*retries)
+        end
+      end
+
+    else
+      events.each do |event|
+        begin
+          ps = connection.prepareStatement(
+              (@unsafe_statement) ? event.sprintf(@statement[0]) : @statement[0]
+          )
+          statement = add_statement_event_params(ps, event) if @statement.length > 1
+          statement.execute
+        rescue => e
+          if retry_exception?(e, event.to_json())
+            events_to_retry.push(event)
+          end
+        ensure
+          statement.close unless statement.nil?
+        end
+      end
+
     end
 
     connection.close unless connection.nil?
 
     return events_to_retry, true
+  end
+
+
+  def process_batch(connection, insert_query, events)
+    # process all the events for a prepared statement in batches based on config
+    events_to_retry = []
+    events_sliced = events.each_slice(@batch_size).to_a
+
+    @logger.debug("Preparing query: #{insert_query}")
+    ps = connection.prepareStatement(insert_query)
+    events_sliced.each do |batch_events|
+      begin
+        batch_events.each do |event|
+          ps = add_statement_event_params(ps, event) if @statement.length > 1
+          ps.addBatch()
+          ps.clearParameters()
+        end
+        @logger.debug("Executing batch insert for #{batch_events.count} events using query: #{insert_query}")
+        # returns array of array positions
+        batch_insert_cnt = ps.executeBatch()
+        @logger.debug("Batch insert query count: #{batch_insert_cnt.count}")
+      rescue => e
+        if retry_exception?(e, nil)
+          events_to_retry.push(*batch_events)
+        end
+      end
+    end
+
+    ps.close unless ps.nil?
+    events_to_retry
   end
 
   def retrying_submit(actions)
@@ -262,7 +336,7 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
 
       # If we're retrying the action sleep for the recommended interval
       # Double the interval for the next time through to achieve exponential backoff
-      Stud.stoppable_sleep(sleep_interval) { @stopping.true? }
+      Stud.stoppable_sleep(sleep_interval) {@stopping.true?}
       sleep_interval = next_sleep_interval(sleep_interval)
     end
   end
@@ -293,7 +367,7 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
         #
         # strftime appears to be the most reliable across drivers.
         statement.setString(idx + 1, value.time.strftime(STRFTIME_FMT))
-      when Fixnum, Integer
+      when Integer
         if value > 2147483647 or value < -2147483648
           statement.setLong(idx + 1, value)
         else
@@ -318,7 +392,7 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
   end
 
   def retry_exception?(exception, event)
-    retrying = (exception.respond_to? 'getSQLState' and (RETRYABLE_SQLSTATE_CLASSES.include?(exception.getSQLState.to_s[0,2]) or @retry_sql_states.include?(exception.getSQLState)))
+    retrying = (exception.respond_to? 'getSQLState' and (RETRYABLE_SQLSTATE_CLASSES.include?(exception.getSQLState.to_s[0, 2]) or @retry_sql_states.include?(exception.getSQLState)))
     log_jdbc_exception(exception, retrying, event)
 
     retrying
@@ -326,8 +400,8 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
 
   def log_jdbc_exception(exception, retrying, event)
     current_exception = exception
-    log_text = 'JDBC - Exception. ' + (retrying ? 'Retrying' : 'Not retrying') 
-    
+    log_text = 'JDBC - Exception. ' + (retrying ? 'Retrying' : 'Not retrying')
+
     log_method = (retrying ? 'warn' : 'error')
 
     loop do
