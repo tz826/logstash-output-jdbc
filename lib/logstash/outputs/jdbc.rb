@@ -140,13 +140,13 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
       @logger.error("JDBC - Statement has no parameters. No events will be inserted into SQL as you're not passing any event data. Likely configuration error.")
     end
 
+    @database = ""
+
     setup_and_test_pool!
   end
 
   def multi_receive(events)
-    events.each_slice(@flush_size) do |slice|
-      retrying_submit(slice)
-    end
+    events.each_slice(@flush_size, &method(:retrying_submit))
   end
 
   def close
@@ -224,6 +224,7 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
 
     begin
       connection = @pool.getConnection
+      @database = connection.getCatalog()
     rescue => e
       log_jdbc_exception(e, true, nil)
       # If a connection is not available, then the server has gone away
@@ -250,7 +251,7 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
         @logger.debug("Processing #{p_events.count} events for #{insert_query}")
         retries = process_batch(connection, insert_query, p_events)
         unless retries.empty?
-          @logger.warn("Failed to insert #{retries.count} events for statement \"#{insert_query}\", re-queuing.")
+          @logger.debug("Failed insert #{retries.count} events for statement \"#{insert_query}\" re-queued")
           events_to_retry.append(*retries)
         end
       end
@@ -297,9 +298,10 @@ class LogStash::Outputs::Jdbc < LogStash::Outputs::Base
         @logger.debug("Executing batch insert for #{batch_events.count} events using query: #{insert_query}")
         # returns array of array positions
         batch_insert_cnt = ps.executeBatch()
-        @logger.debug("Batch insert query count: #{batch_insert_cnt.count}")
+        @logger.info("Successfully inserted #{batch_insert_cnt.count} events into #{@database}")
       rescue => e
         if retry_exception?(e, nil)
+          @logger.warn("Failed to insert #{batch_events.count} events into #{@database}")
           events_to_retry.push(*batch_events)
         end
       end
