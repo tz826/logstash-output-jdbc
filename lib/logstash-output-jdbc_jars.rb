@@ -1,4 +1,9 @@
-# this is a generated file, to avoid over-writing it just delete this comment
+# encoding: utf-8
+# require 'logstash/environment'
+# root_dir = File.expand_path(File.join(File.dirname(__FILE__), '..'))
+# LogStash::Environment.load_runtime_jars! File.join(root_dir, 'vendor')
+
+#this is a generated file, to avoid over-writing it just delete this comment
 begin
   require 'jar_dependencies'
 rescue LoadError
@@ -14,3 +19,7 @@ if defined? Jars
   require_jar 'com.zaxxer', 'HikariCP', '2.7.9'
   require_jar 'org.apache.logging.log4j', 'log4j-slf4j-impl', '2.6.2'
 end
+
+
+
+
